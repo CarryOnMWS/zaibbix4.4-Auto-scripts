@@ -1,0 +1,201 @@
+#! /bin/bash
+# zabbix4.4安装
+#检查操作系统版本，该脚本只能运行在 Centos 7.x 系统上
+cat /etc/redhat-release |grep -i centos |grep '7.[[:digit:]]' &>/dev/null
+if [ $# != 0 ]
+then
+    echo -e "\e[1;31m不支持的操作系统，该脚本只适用于CentOS 7.x  x86_64 操作系统\e[0m"
+    exit 1
+fi
+#配置阿里云yum源和EPEL源
+#安装wget
+cd /etc/yum.repos.d/
+yum -y install wget
+#备份系统原生的yum源
+mkdir repo_bak
+mv *.repo repo_bak/
+#下载阿里云yum源,下载CentOS-Base.repo到/etc/yum.repos.d/路径下：
+wget -O /etc/yum.repos.d/CentOS-Base.repo http://mirrors.aliyun.com/repo/Centos-7.repo
+# 清除并生成新的缓存
+yum clean all
+yum makecache
+#安装EPEL源
+yum install -y prep epel-release
+yum clean all
+yum makecache
+#Zabbix-Server对时间的精准要求比较高建议设置NTP自动同步
+yum install ntp -y
+systemctl enable ntpd
+systemctl start ntpd
+#切回存放脚本的目录
+cd /home/vagrant/
+#查看系统拥有语言包,如果没有中文，则安装中文
+locale -a |grep -c "zh_CN*"
+if [ $# = 0 ];then
+	yum -y install kde-l10n-Chinese
+	yum -y reinstall glibc-common
+fi
+LANG=zh_CN.UTF-8
+localectl set-locale LANG=zh_CN.UTF-8
+ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+ 
+echo -e "\e[1;31m如是安装server端那该机器并未安装mysql数据库和nginx（稍后脚本会自动安装数据库和httpd）！\n如已准备好,输入1则开始安装server端,输入2则开始安装agent端,如未准备好则输入其它任意键退出！\e[0m"
+read -p "请输入：" zbks
+case "$zbks" in
+1)
+#安装配置server端
+ 
+#配置安装zabbix server端所需要的的变量
+#本机IP
+host_ip=$(ip -4 a|grep inet|head -3|tail -1|awk -F '/' '{print $1}'|awk -F' ' '{print $2}')
+#zabbix用户密码
+zabbix_pwd=zabbix
+ 
+#安装mariadb10.1
+echo -e "\e[1;31m安装mariadb10.1中，请稍后..\e[0m"
+if [ ! -f "/etc/yum.repos.d/mariadb.repo" ]; then
+touch /etc/yum.repos.d/mariadb.repo
+fi
+cat >> /etc/yum.repos.d/mariadb.repo <<-EOF
+[mariadb]
+name = MariaDB
+baseurl = https://mirrors.ustc.edu.cn/mariadb/yum/10.1/centos7-amd64
+gpgkey=https://mirrors.ustc.edu.cn/mariadb/yum/RPM-GPG-KEY-MariaDB
+gpgcheck=1
+EOF
+yum install -y mariadb-server mariadb
+systemctl enable mariadb
+systemctl start mariadb
+if [ $? = 0 ];then 
+	echo -e "\e[1;31m数据库mariadb10.1已安装完成\n准备开始安装zabbix4.4 Server端\e[0m"
+	# 配置zabbix4.4yum源并下载安装
+	echo -e "\e[1;31m正在配置zabbix4.4的yum源\e[0m"
+	cd /etc/yum.repos.d/
+	rpm -Uvh https://repo.zabbix.com/zabbix/4.4/rhel/7/x86_64/zabbix-release-4.4-1.el7.noarch.rpm
+	sed -i 's/repo.zabbix.com/mirrors.aliyun.com\/zabbix/g' /etc/yum.repos.d/zabbix.repo
+	yum clean all
+	echo -e "\e[1;31m正在安装zabbix..\e[0m"
+	yum -y install zabbix-server-mysql zabbix-web-mysql zabbix-agent zabbix-get
+	# 创建一个zabbix数据库,用户并导入数据
+	echo -e "\e[1;31m正在导入数据,请稍后..\e[0m"
+	mysql -e "create database zabbix character set utf8 collate utf8_bin;"
+	mysql -e "grant all privileges on zabbix.* to zabbix@'localhost' identified by 'zabbix';"
+	mysql -e "flush privileges;"
+	#设置mysql root密码为 admin 删除空值用户
+	mysqladmin -uroot password admin
+	mysql -uroot -padmin -e "delete from mysql.user where user='';"
+	zcat /usr/share/doc/zabbix-server-mysql*/create.sql.gz | mysql zabbix
+	# 修改zabbix server
+	# 设置启用icmp协议PING主机方式启动子进程数量
+	sed -i "/^# StartPingers=1/a StartPingers=10" /etc/zabbix/zabbix_server.conf
+	# 初始化时启动子进程数量，数量越多，则服务端吞吐能力越强，对系统资源消耗越大，根据轮询器实例数量设置
+	sed -i "/^# StartPollers=5/a StartPollers=10" /etc/zabbix/zabbix_server.conf
+	# Trappers初始子进程数
+	sed -i "/^# StartTrappers=5/a StartTrappers=20" /etc/zabbix/zabbix_server.conf
+	# 用于存储主机、监控项、触发器数据的共享内存大小
+	sed -i "/^# CacheSize=8M/a CacheSize=256M" /etc/zabbix/zabbix_server.conf
+	# Zabbix 缓存更新频率, 单位秒
+	sed -i "/^# CacheUpdateFrequency=60/a CacheUpdateFrequency=180" /etc/zabbix/zabbix_server.conf
+	# 历史缓存数据大小
+	sed -i "/^# HistoryCacheSize=16M/a HistoryCacheSize=64M" /etc/zabbix/zabbix_server.conf
+	# 用于索引历史缓存中历史数据的共享内存大小
+	sed -i "/^# HistoryIndexCacheSize=4M/a HistoryIndexCacheSize=10M" /etc/zabbix/zabbix_server.conf
+	# agent, SNMP 设备或外部检查的超时时长(单位秒)
+	sed -i "s/Timeout=4/Timeout=6/" /etc/zabbix/zabbix_server.conf
+	# 用于存储趋势数据的共享内存大小
+	sed -i "/^# TrendCacheSize=4M/a TrendCacheSize=128M" /etc/zabbix/zabbix_server.conf
+	# 缓存item历史数据请求的共享内存大小，当缓存大小超过共享内存时，每5分钟会向服务器日志写入一条警告信息.
+	sed -i "/^# ValueCacheSize=8M/a ValueCacheSize=128M" /etc/zabbix/zabbix_server.conf
+	# zabbix用户密码
+	sed -i "/^# DBPassword=/a DBPassword=$zabbix_pwd" /etc/zabbix/zabbix_server.conf
+	# 开启日志，默认0为不开启，设置其它数字为开启并按数值轮转，单位MB
+	sed -i "s/LogFileSize=0/LogFileSize=5/" /etc/zabbix/zabbix_server.conf
+	# 修改zabbix web
+	sed -i 's/# php_value date.timezone Europe\/Riga/php_value date.timezone Asia\/Shanghai/' /etc/httpd/conf.d/zabbix.conf
+	# 下面这个文件存放了zabbix的数据库用户密码，如果web界面的初始设置错误就可以在这里修改
+	cp /usr/share/zabbix/conf/zabbix.conf.php.example /etc/zabbix/web/zabbix.conf.php
+	sed -i "10c \$DB[\"PASSWORD\"]    		= '$zabbix_pwd';" /etc/zabbix/web/zabbix.conf.php
+	#设置server端IP，被动模式
+	sed -i "s/Server=127.0.0.1/Server=$host_ip/" /etc/zabbix/zabbix_agentd.conf
+	#设置server端IP，主动模式，当和上一行一起启动时，认为主动
+	sed -i "s/ServerActive=127.0.0.1/ServerActive=$host_ip/" /etc/zabbix/zabbix_agentd.conf
+	#指定当前主机的主机名，server端通过此参数对应的主机名识别当前主机(主动模式)
+	sed -i "/^Hostname=/d" /etc/zabbix/zabbix_agentd.conf
+	sed -i "/^# Hostname=/a Hostname=$host_ip" /etc/zabbix/zabbix_agentd.conf
+	#添加是否限制用户自定义 keys 使用特殊字符
+	sed -i "/^# UnsafeUserParameters=0/a UnsafeUserParameters=1" /etc/zabbix/zabbix_agentd.conf
+	echo "UserParameter=mem.free,/usr/bin/free -m | awk '/^Mem/{print \$4}'" >> /etc/zabbix/zabbix_agentd.d/userparameter_mem.conf
+	
+	#切回存放脚本的目录，添加中文字体
+	cd /home/vagrant/
+	cp simfang.ttf /usr/share/zabbix/assets/fonts/
+	sed -i s/graphfont/simfang/g /usr/share/zabbix/include/defines.inc.php
+	#Centos7操作防火墙规则设置
+	systemctl start firewalld
+	firewall-cmd --permanent --add-port=80/tcp
+	firewall-cmd --permanent --add-port=10050/tcp
+	firewall-cmd --permanent --add-port=10051/tcp
+	firewall-cmd --reload
+	#关闭SELinx的
+	setenforce 0
+	sed -i 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/selinux/config
+	# 启动zabbix相关服务并开机自启
+	systemctl enable zabbix-server zabbix-agent httpd
+	systemctl start zabbix-server zabbix-agent httpd
+	echo -e "\e[1;31m已启动zabbix服务端,接下来请在$host_ip/zabbix页面进行web设置\n登录用户为Admin,密码为$zabbix_pwd,如果web界面的数据库IP,密码端口等信息设置失误可以在/etc/zabbix/web/zabbix.conf.php文件内修改\n数据库root密码admin，如有需要请手动修改\n如web界面无法连接数据库,请检查zabbix用户是否能登陆数据库\nagent端已安装完成,默认主动模式,如需更改为被动模式则将/etc/zabbix/zabbix_agentd.conf文件内的ServerActive=$host_ip注释掉,端口默认为10050\n接下来请在server端使用zabbix_get -s $host_ip -p 10050 -k mem.free命令测试是否能拉取到本机的剩余内存\e[0m"
+else
+	echo -e "\e[1;31m mariadb启动失败,请检查环境！\e[0m"
+fi
+;;
+ 
+2)
+#安装配置agent端
+ 
+#本机IP
+a_host_ip=$(ip -4 a|grep inet|head -3|tail -1|awk -F '/' '{print $1}'|awk -F' ' '{print $2}')
+ 
+#配置zabbix4.4yum源并下载安装
+echo -e "\e[1;31m正在配置zabbix4.4的yum源\e[0m"
+cd /etc/yum.repos.d/
+rpm -Uvh https://repo.zabbix.com/zabbix/4.4/rhel/7/x86_64/zabbix-release-4.4-1.el7.noarch.rpm
+sed -i 's/repo.zabbix.com/mirrors.aliyun.com\/zabbix/g' /etc/yum.repos.d/zabbix.repo
+yum clean all
+echo -e "\e[1;31m正在安装zabbix-agent请稍后\e[0m"
+yum -y install zabbix-agent
+while [ 1 ]
+do
+read -p "请输入server端IP：" sip
+echo -e "\e[1;31m server端IP为$sip,如果正确请按y继续配置,其它任意键重新输入\e[0m"
+read -p "是否正确："  zq
+if [ $zq = y ];then
+	#设置server端IP，被动模式
+	sed -i "s/Server=127.0.0.1/Server=$sip/" /etc/zabbix/zabbix_agentd.conf
+	#设置server端IP，主动模式，当和上一行一起启动时，认为主动
+	sed -i "s/ServerActive=127.0.0.1/ServerActive=$sip/" /etc/zabbix/zabbix_agentd.conf
+	#指定当前主机的主机名，server端通过此参数对应的主机名识别当前主机(主动模式)
+	sed -i "/^Hostname=/d" /etc/zabbix/zabbix_agentd.conf
+	sed -i "/^# Hostname=/a Hostname=$a_host_ip" /etc/zabbix/zabbix_agentd.conf
+	#添加是否限制用户自定义 keys 使用特殊字符
+	sed -i "/^# UnsafeUserParameters=0/a UnsafeUserParameters=1" /etc/zabbix/zabbix_agentd.conf
+	#Centos7操作防火墙规则设置
+	firewall-cmd --permanent --add-port=80/tcp
+	firewall-cmd --permanent --add-port=10050/tcp
+	firewall-cmd --permanent --add-port=10051/tcp
+	firewall-cmd --reload
+	systemctl enable zabbix-agent
+	echo "UserParameter=mem.free,/usr/bin/free -m | awk '/^Mem/{print \$4}'" >> /etc/zabbix/zabbix_agentd.d/userparameter_mem.conf
+	systemctl start zabbix-agent
+	if [ $? = 0 ];then
+		echo -e "\e[1;31m agent端已安装完成,默认主动模式,如需更改为被动模式则将/etc/zabbix/zabbix_agentd.conf文件内的ServerActive=$sip注释掉,端口默认为10050\n接下来请在server端使用zabbix_get -s $a_host_ip -p 10050 -k mem.free命令测试是否能拉取到本机的剩余内存\e[0m"
+	else
+		echo -e "\e[1;31m启动失败，请查看报错信息。\e[0m"	
+	fi
+	exit
+fi
+done
+;;
+ 
+*)
+echo -e "\e[1;31m已退出\e[0m"
+	exit 
+esac
